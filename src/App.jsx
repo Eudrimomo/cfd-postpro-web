@@ -41,8 +41,11 @@ export default function App() {
   }, [selectedSim])
 
   const clesCourbes = convergence.length > 0 ? Object.keys(convergence[0]) : []
-  const axeX = clesCourbes[0]
-  const variablesY = clesCourbes.slice(1)
+  const hasFlowTime = clesCourbes.includes('flow-time')
+  const axeX = hasFlowTime ? 'flow-time' : clesCourbes[0]
+  const variablesY = clesCourbes.filter(
+    (cle) => cle !== axeX && cle !== clesCourbes[0]
+  )
 
   return (
     <div className="container">
@@ -90,8 +93,9 @@ export default function App() {
                 layout={{
                   autosize: true,
                   height: 420,
-                  xaxis: { title: axeX },
-                  margin: { t: 20, r: 20, l: 50, b: 50 },
+                  xaxis: { title: hasFlowTime ? 'Flow Time (s)' : axeX },
+                  yaxis: { title: 'Valeur' },
+                  margin: { t: 20, r: 20, l: 55, b: 50 },
                 }}
                 style={{ width: '100%' }}
                 useResizeHandler
