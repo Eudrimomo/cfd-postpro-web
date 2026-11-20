@@ -63,7 +63,7 @@ const CHAMPS_EDITION_PAR_PROFIL = {
 }
 
 const ROLE_LABELS = { entree: 'entrée', inlet: 'entrée', sortie: 'sortie', outlet: 'sortie', paroi: 'paroi', wall: 'paroi', symetrie: 'symétrie' }
-const COLONNES_ABSCISSE = ['flow-time', 'flow_time', 'time', 'temps', 'iteration', 'iter', 'step', 'time step', 'time-step']
+const COLONNES_ABSCISSE = ['flow-time', 'flow_time', 'time', 'temps', 'iteration', 'iter', 'step', 'time step', 'time-step', 'position (x)']
 const PLOTLY_COLORS = ['#2563eb', '#ea580c', '#16a34a', '#9333ea', '#dc2626', '#0891b2']
 
 function formaterNombre(val) {
@@ -142,16 +142,6 @@ function extraireAxes(donnees, abscisseDeclaree = null) {
   return { axeX, labelX, isIntegerX, nbPoints: donnees.length, variablesY }
 }
 
-function grouperVariablesParGrandeur(variablesY) {
-  const groupes = {}
-  for (const v of variablesY) {
-    const g = deduireGroupeGrandeur(v)
-    if (!groupes[g.id]) groupes[g.id] = { ...g, vars: [] }
-    groupes[g.id].vars.push(v)
-  }
-  return Object.values(groupes)
-}
-
 function appliquerMoyenneGlissante(vals, fenetre) {
   if (!fenetre || fenetre <= 1) return vals
   return vals.map((_, i) => {
@@ -177,7 +167,6 @@ function regressionLineaire(xs, ys) {
   return { pente, ordonnee: my - pente * mx }
 }
 
-// Ajustement quadratique ΔP = a * Q^2 avec calcul du coefficient R² (REV-39)
 function ajustementQuadratiqueAvecR2(qs, dps) {
   let num = 0, den = 0
   for (let i = 0; i < qs.length; i++) {
@@ -198,7 +187,6 @@ function ajustementQuadratiqueAvecR2(qs, dps) {
   return { a, r2 }
 }
 
-// Estimation de fréquence dominante par DFT simple (pour signaux périodiques en import local — REV-44)
 function estimerFrequenceDFT(vals, dt) {
   if (!dt || dt <= 0 || vals.length < 16) return { freqHz: null, nbPeriodes: null, moyPeriodes: null }
   const N = vals.length
@@ -242,7 +230,7 @@ function estLigneNumerique(ligne) {
 function parserFichierFluent(texte, nomFichier = 'local') {
   const lignes = texte.split(/\r?\n/)
   const debutDonnees = lignes.findIndex((l) => estLigneNumerique(l))
-  if (debutDonnees === -1) throw new Error('Aucune donnée numérique détectée dans ce fichier.')
+  if (debutDonnees === -1) throw new Error(`Aucune donnée numérique détectée dans ${nomFichier}.`)
 
   let colonnes = null
   for (let i = debutDonnees - 1; i >= 0; i--) {
@@ -268,17 +256,28 @@ function parserFichierFluent(texte, nomFichier = 'local') {
     const vals = l.split(sepRegex).filter(Boolean).map(Number)
     if (vals.length >= 2 && vals.every((v) => !Number.isNaN(v))) lignesValides.push(vals)
   }
-  if (lignesValides.length === 0) throw new Error('Impossible de lire les valeurs numériques du fichier.')
+  if (lignesValides.length === 0) throw new Error(`Impossible de lire les valeurs numériques de ${nomFichier}.`)
 
   const nbCols = lignesValides[0].length
-  const nomsColonnes = colonnes && colonnes.length === nbCols ? colonnes : Array.from({ length: nbCols }, (_, idx) => `Col_${idx}`)
+  const nomBase = nomFichier.replace(/\.[^/.]+$/, '')
+  const isXY = nomFichier.toLowerCase().endsWith('.xy')
+
+  let nomsColonnes
+  if (colonnes && colonnes.length === nbCols) {
+    nomsColonnes = colonnes
+  } else if (isXY && nbCols === 2) {
+    nomsColonnes = ['Position (x)', nomBase]
+  } else {
+    nomsColonnes = Array.from({ length: nbCols }, (_, idx) => (idx === 0 ? 'Abscisse' : `${nomBase}_${idx}`))
+  }
+
   const donnees = lignesValides.filter((row) => row.length === nbCols).map((row) => {
     const obj = {}
     nomsColonnes.forEach((col, idx) => { obj[col] = row[idx] })
     return obj
   })
 
-  const { axeX, variablesY } = extraireAxes(donnees)
+  const { axeX, labelX, isIntegerX, variablesY } = extraireAxes(donnees)
   const isTimeAxis = axeX.toLowerCase().includes('time') && !axeX.toLowerCase().includes('step')
   let dt = null
   if (isTimeAxis && donnees.length >= 2) {
@@ -291,12 +290,12 @@ function parserFichierFluent(texte, nomFichier = 'local') {
   }
 
   const kpiFinaux = {}
-  // REV-45 : fenêtre adaptative = 20 % finaux (min 20 pts)
   const nWin = Math.min(donnees.length, Math.max(20, Math.round(0.2 * donnees.length)))
   const sliceFin = donnees.slice(-nWin)
 
-  for (const col of variablesY) {
+  const series = variablesY.map((col) => {
     const allVals = donnees.map((r) => r[col])
+    const xVals = donnees.map((r) => r[axeX])
     const vals = sliceFin.map((r) => r[col])
     let mean = vals.reduce((a, b) => a + b, 0) / vals.length
     const std = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length)
@@ -316,7 +315,9 @@ function parserFichierFluent(texte, nomFichier = 'local') {
     let freqHz = null, nbPeriodes = null
     let varRelPct = null
 
-    if (rangeTot === 0) {
+    if (isXY) {
+      convergence = null
+    } else if (rangeTot === 0) {
       convergence = 'constante'
       varRelPct = 0
     } else if (donnees.length < 20) {
@@ -348,14 +349,27 @@ function parserFichierFluent(texte, nomFichier = 'local') {
       strouhal: null,
       variation_rel_pct: varRelPct,
       unite: deduireGroupeGrandeur(col).unite === 'Valeur' ? '-' : deduireGroupeGrandeur(col).unite,
-      methode: estPeriodique ? 'analyse_periodique' : 'fenetre_adaptative_20pct',
-      fenetre: nWin,
+      methode: isXY ? `profil spatial (${donnees.length} pts)` : (estPeriodique ? 'analyse_periodique' : 'fenetre_adaptative_20pct'),
+      fenetre: isXY ? donnees.length : nWin,
       convergence,
       source: `${nomFichier}:${col}`,
     }
-  }
 
-  return { donnees, kpiFinaux, axeX, dt }
+    return {
+      id: `${nomFichier}::${col}`,
+      fileName: nomFichier,
+      colY: col,
+      labelX,
+      isIntegerX,
+      isXY,
+      nbPoints: donnees.length,
+      x: xVals,
+      y: allVals,
+      unite: deduireGroupeGrandeur(col).unite,
+    }
+  })
+
+  return { donnees, series, kpiFinaux, axeX, dt }
 }
 
 function parserFichierXY(texte, nomFichier, corde = 1) {
@@ -386,19 +400,15 @@ function parserPolaireRef(texte, nomFichier) {
   return { nom: nomFichier, alpha, cl, cd }
 }
 
-function creerLayoutPlotly(
-  titre, labelX, labelY, height = 400, yScale = 'linear',
-  isIntegerX = false, nbPoints = 0, syncedRangeX = null,
-  dualYAxis = false, leftColor = '#2563eb', rightColor = '#ea580c', leftLabel = null, rightLabel = null
-) {
+function creerLayoutPlotly(titre, labelX, labelY, height = 370, yScale = 'linear', isIntegerX = false, nbPoints = 0, syncedRangeX = null) {
   return {
     autosize: true,
     height,
-    title: { text: titre, font: { size: 15, color: '#1e293b' } },
+    title: { text: titre, font: { size: 14, color: '#1e293b' } },
     showlegend: true,
     legend: { orientation: 'h', x: 0.5, xanchor: 'center', y: -0.26 },
     xaxis: {
-      title: { text: labelX, font: { size: 13, color: '#1e293b' }, standoff: 10 },
+      title: { text: labelX, font: { size: 12, color: '#1e293b' }, standoff: 10 },
       showgrid: true,
       gridcolor: '#e2e8f0',
       ...(isIntegerX ? { tickformat: 'd', ...(nbPoints > 0 && nbPoints <= 20 ? { dtick: 1 } : {}) } : {}),
@@ -406,34 +416,20 @@ function creerLayoutPlotly(
     },
     yaxis: {
       type: yScale,
-      title: { text: dualYAxis ? (leftLabel || labelY) : labelY, font: { size: 13, color: dualYAxis ? leftColor : '#1e293b' } },
-      tickfont: { color: dualYAxis ? leftColor : '#1e293b' },
+      title: { text: labelY, font: { size: 12, color: '#1e293b' } },
       showgrid: true,
       gridcolor: '#e2e8f0',
       zeroline: true,
       zerolinecolor: '#94a3b8',
     },
-    ...(dualYAxis
-      ? {
-          yaxis2: {
-            title: { text: rightLabel || 'Axe droit', font: { size: 13, color: rightColor } },
-            tickfont: { color: rightColor },
-            overlaying: 'y',
-            side: 'right',
-            showgrid: false,
-            zeroline: false,
-          },
-        }
-      : {}),
     paper_bgcolor: '#ffffff',
     plot_bgcolor: '#ffffff',
     font: { color: '#1e293b' },
-    margin: { t: 55, r: dualYAxis ? 70 : 25, l: 75, b: 95 },
+    margin: { t: 50, r: 20, l: 70, b: 90 },
   }
 }
 
 export default function App() {
-  // Authentification Supabase (REV-43)
   const [user, setUser] = useState(null)
   const [showAuthModal, setShowAuthModal] = useState(false)
   const [authEmail, setAuthEmail] = useState('')
@@ -473,11 +469,8 @@ export default function App() {
   const [filterProfil, setFilterProfil] = useState('tous')
   const [filterStatut, setFilterStatut] = useState('tous')
 
-  // Contrôles graphiques (Modif #1 : splitPlots pour côte à côte sur une même simulation)
   const [yScale, setYScale] = useState('linear')
   const [smoothingWindow, setSmoothingWindow] = useState(0)
-  const [dualYAxis, setDualYAxis] = useState(false)
-  const [splitPlots, setSplitPlots] = useState(false)
   const [syncedRangeX, setSyncedRangeX] = useState(null)
 
   const [excludedPolarIds, setExcludedPolarIds] = useState([])
@@ -529,9 +522,7 @@ export default function App() {
     else { setShowAuthModal(false); setAuthPassword('') }
   }
 
-  const seDeconnecter = async () => {
-    await supabase.auth.signOut()
-  }
+  const seDeconnecter = async () => { await supabase.auth.signOut() }
 
   const enrichirSimulation = (sim) => {
     if (!sim) return null
@@ -542,7 +533,6 @@ export default function App() {
 
     for (const [k, rawV] of Object.entries(sim.kpi_finaux || {})) {
       const kpi = { ...normaliserKpi(rawV) }
-      // Calcul dynamique du Strouhal si longueur_ref/corde et vitesse sont renseignés (REV-44)
       const lRef = metadonnees.corde || metadonnees.diametre_hydraulique || metadonnees.longueur_ref
       const vRef = metadonnees.vitesse_amont || metadonnees.vitesse_ref
       if (kpi.frequence_hz && lRef && vRef && Number(vRef) > 0) {
@@ -619,7 +609,6 @@ export default function App() {
     supabase.from('convergence_data').select('donnees').eq('simulation_id', simActiveB.id).single().then(({ data }) => setConvergenceB(data?.donnees || []))
   }, [compareMode, simActiveB?.id])
 
-  // Suppression sécurisée (REV-43 & REV-46)
   const supprimerSimulationActive = async () => {
     if (!simActive) return
     if (!simActive.isLocal && !user) return
@@ -795,46 +784,45 @@ export default function App() {
 
   const reinitialiserFiltres = () => { setSearchQuery(''); setFilterProfil('tous'); setFilterStatut('tous') }
 
+  // v3.1 : Traitement 100 % indépendant de chaque fichier (aucune troncature, chaque fichier garde sa longueur et son axe X)
   const traiterFichiersLocaux = async (fileList) => {
     const files = Array.from(fileList || [])
     if (files.length === 0) return
     setUploadError('')
     try {
-      const parsedList = []
+      const allSeries = []
+      const kpiFusionnes = {}
+      let premierDt = null
+      let premiereConvergence = []
+
       for (const file of files) {
-        parsedList.push({ name: file.name, ...parserFichierFluent(await file.text(), file.name) })
+        const parsed = parserFichierFluent(await file.text(), file.name)
+        allSeries.push(...parsed.series)
+        Object.assign(kpiFusionnes, parsed.kpiFinaux)
+        if (!premierDt && parsed.dt) premierDt = parsed.dt
+        if (premiereConvergence.length === 0) premiereConvergence = parsed.donnees
       }
-      const nMin = Math.min(...parsedList.map((p) => p.donnees.length))
-      const donneesFusionnees = []
-      for (let i = 0; i < nMin; i++) {
-        const row = { ...parsedList[0].donnees[i] }
-        for (let fIdx = 1; fIdx < parsedList.length; fIdx++) {
-          for (const [k, v] of Object.entries(parsedList[fIdx].donnees[i])) {
-            if (!(k in row)) row[k] = v
-          }
-        }
-        donneesFusionnees.push(row)
-      }
-      const kpiFusionnes = Object.assign({}, ...parsedList.map((p) => p.kpiFinaux))
-      const nomsPropres = parsedList.map((p) => p.name.replace(/\.[^/.]+$/, ''))
+
+      const nomsPropres = files.map((f) => f.name.replace(/\.[^/.]+$/, ''))
       const nomSim = nomsPropres.length > 1 ? nomsPropres.join(' + ') : nomsPropres[0]
 
       const simLocale = {
         id: `local-${Date.now()}`,
         nom: nomSim,
-        description: `Analyse temporaire (${files.length} fichier${files.length > 1 ? 's' : ''}, ${nMin} lignes)`,
+        description: `Analyse temporaire (${files.length} fichier${files.length > 1 ? 's' : ''} traités indépendamment)`,
         profil_type: 'generique',
         profil_version: '1.3',
         statut: 'complete',
         projet: 'Session temporaire',
         tags: ['temporaire'],
-        metadonnees: { abscisse: parsedList[0].axeX, ...(parsedList[0].dt ? { dt: Number(parsedList[0].dt.toPrecision(4)) } : {}) },
+        metadonnees: { ...(premierDt ? { dt: Number(premierDt.toPrecision(4)) } : {}) },
         validation: { statut: 'OK', messages: [], composants: { courbes: true, parois: false, champs: false, metadonnees: true } },
         kpi_finaux: kpiFusionnes,
         profils_paroi: {},
         url_visuel_3d: null,
         isLocal: true,
-        localConvergence: donneesFusionnees,
+        localSeries: allSeries,
+        localConvergence: premiereConvergence,
       }
 
       setSimulations((prev) => [simLocale, ...prev])
@@ -867,7 +855,23 @@ export default function App() {
   const isComparing = compareMode && simActive && simActiveB
   const axesA = extraireAxes(convergence, simActive?.metadonnees?.abscisse)
   const axesB = extraireAxes(convergenceB, simActiveB?.metadonnees?.abscisse)
-  const groupesA = useMemo(() => grouperVariablesParGrandeur(axesA.variablesY), [axesA.variablesY])
+
+  // Construction des séries indépendantes à afficher côte à côte (local ou Supabase)
+  const seriesA = useMemo(() => {
+    if (simActive?.localSeries && simActive.localSeries.length > 0) return simActive.localSeries
+    return axesA.variablesY.map((varY) => ({
+      id: varY,
+      fileName: simActive?.nom || '',
+      colY: varY,
+      labelX: axesA.labelX,
+      isIntegerX: axesA.isIntegerX,
+      isXY: false,
+      nbPoints: axesA.nbPoints,
+      x: convergence.map((row) => row[axesA.axeX]),
+      y: convergence.map((row) => row[varY]),
+      unite: deduireGroupeGrandeur(varY).unite,
+    }))
+  }, [simActive, convergence, axesA])
 
   const tracesA = axesA.variablesY.map((varY, i) => ({
     x: convergence.map((row) => row[axesA.axeX]),
@@ -1048,7 +1052,7 @@ export default function App() {
   const frontieresObj = simActive?.metadonnees?.frontieres && typeof simActive.metadonnees.frontieres === 'object' ? simActive.metadonnees.frontieres : null
   const metaEntries = Object.entries(simActive?.metadonnees || {}).filter(([k]) => k !== 'frontieres')
   const paroi = simActive?.profils_paroi || {}
-  const composants = { courbes: convergence.length > 0, parois: Object.keys(paroi).length > 0, champs: Boolean(simActive?.url_visuel_3d), metadonnees: metaEntries.length > 0 }
+  const composants = { courbes: seriesA.length > 0, parois: Object.keys(paroi).length > 0, champs: Boolean(simActive?.url_visuel_3d), metadonnees: metaEntries.length > 0 }
 
   const isAile2D = !isComparing && simActive?.profil_type === 'aile_2d'
   const isInterne = !isComparing && simActive?.profil_type === 'interne'
@@ -1071,7 +1075,6 @@ export default function App() {
     <div className="container">
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
         <h1 style={{ margin: 0 }}>Post-Traitement CFD — ANSYS Fluent</h1>
-        {/* Connexion / Déconnexion Supabase Auth (REV-43) */}
         <div>
           {user ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -1084,7 +1087,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* Modale de connexion Supabase Auth */}
       {showAuthModal && (
         <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(15, 23, 42, 0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
           <form onSubmit={seConnecter} className="card" style={{ width: 360, maxWidth: '90vw', margin: 0 }}>
@@ -1101,7 +1103,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Zone d'upload manuel multi-fichiers */}
+      {/* Zone d'upload manuel multi-fichiers indépendants */}
       <div
         className="card"
         onDragOver={(e) => { e.preventDefault(); setIsDragging(true) }}
@@ -1175,7 +1177,6 @@ export default function App() {
 
           {simActive && (
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              {/* REV-43 & REV-46 : Supprimer visible seulement pour un import temporaire ou un admin connecté */}
               {simActive.isLocal && (
                 <button onClick={supprimerSimulationActive} style={{ ...btnStyle, backgroundColor: '#64748b' }}>
                   ✕ Retirer de la session
@@ -1200,8 +1201,10 @@ export default function App() {
 
       {!loadingSims && !simActive && (
         <div className="card" style={{ textAlign: 'center', padding: 28, color: '#475569' }}>
-          <p style={{ margin: '0 0 12px 0', fontSize: 15 }}>Aucune simulation ne correspond aux filtres sélectionnés.</p>
-          <button onClick={reinitialiserFiltres} style={btnStyle}>Réinitialiser les filtres</button>
+          <p style={{ margin: '0 0 12px 0', fontSize: 15 }}>Aucune simulation disponible. Glissez-déposez des fichiers Fluent ci-dessus pour démarrer.</p>
+          {(searchQuery || filterProfil !== 'tous' || filterStatut !== 'tous') && (
+            <button onClick={reinitialiserFiltres} style={btnStyle}>Réinitialiser les filtres</button>
+          )}
         </div>
       )}
 
@@ -1343,7 +1346,6 @@ export default function App() {
             </div>
           )}
 
-          {/* ONGLET SYNTHÈSE & CONVERGENCE */}
           {activeTab === 'synthese' && (
             <>
               <div className="card">
@@ -1453,30 +1455,13 @@ export default function App() {
                 </div>
               )}
 
-              {/* COURBES DE CONVERGENCE (Modif #1 : bouton Côte à côte + REV-47 : Double axe Y couleurs cohérentes) */}
-              {(tracesA.length > 0 || tracesB.length > 0) && (
+              {/* COURBES CÔTE À CÔTE PAR DÉFAUT (sans superposition ni double axe Y) */}
+              {(seriesA.length > 0 || tracesB.length > 0) && (
                 <div className="card">
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
-                    <h2 style={{ margin: 0 }}>{isComparing ? 'Courbes de convergence côte à côte' : 'Courbes de convergence'}</h2>
+                    <h2 style={{ margin: 0 }}>{isComparing ? 'Courbes de convergence côte à côte' : 'Courbes (affichage côte à côte)'}</h2>
 
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                      {!isComparing && axesA.variablesY.length > 1 && (
-                        <>
-                          <button
-                            onClick={() => { setSplitPlots((v) => !v); setDualYAxis(false) }}
-                            style={{ ...btnStyle, backgroundColor: splitPlots ? '#2563eb' : '#e2e8f0', color: splitPlots ? '#fff' : '#1e293b' }}
-                          >
-                            📊 {splitPlots ? 'Côte à côte : Actif' : 'Côte à côte'}
-                          </button>
-                          <button
-                            onClick={() => { setDualYAxis((v) => !v); setSplitPlots(false) }}
-                            style={{ ...btnStyle, backgroundColor: dualYAxis ? '#7c3aed' : '#e2e8f0', color: dualYAxis ? '#fff' : '#1e293b' }}
-                          >
-                            ⇄ {dualYAxis ? 'Double axe Y : Actif' : 'Double axe Y'}
-                          </button>
-                        </>
-                      )}
-
                       <select value={smoothingWindow} onChange={(e) => setSmoothingWindow(Number(e.target.value))} style={{ padding: '7px 10px', borderRadius: 6, border: '1px solid #cbd5e1', fontSize: 13 }}>
                         <option value={0}>Lissage : Aucun</option>
                         <option value={5}>Moy. glissante (5 pts)</option>
@@ -1491,7 +1476,7 @@ export default function App() {
                       {!isComparing && (
                         <>
                           <button onClick={() => exporterCSV(convergence, simActive.nom)} style={{ ...btnStyle, backgroundColor: '#475569' }}>⬇ CSV</button>
-                          <button onClick={() => telechargerGraphique(activePlotRef, `${simActive.nom}_convergence`)} style={btnStyle}>⬇ PNG</button>
+                          <button onClick={() => telechargerGraphique(activePlotRef, `${simActive.nom}_courbe`)} style={btnStyle}>⬇ PNG</button>
                         </>
                       )}
                     </div>
@@ -1514,27 +1499,34 @@ export default function App() {
                         <Plot data={tracesB} layout={creerLayoutPlotly(simActiveB.nom, axesB.labelX, 'Valeur', 400, yScale, axesB.isIntegerX, axesB.nbPoints, syncedRangeX)} style={{ width: '100%' }} useResizeHandler onRelayout={gererRelayoutZoom} onInitialized={(_, g) => { plotDivRefB.current = g }} onUpdate={(_, g) => { plotDivRefB.current = g }} />
                       </div>
                     </div>
-                  ) : splitPlots ? (
-                    /* Modif #1 : Chaque courbe dans son propre graphe côte à côte (zoom X synchronisé) */
+                  ) : (
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))', gap: 16 }}>
-                      {axesA.variablesY.map((varY, idx) => {
-                        const grp = deduireGroupeGrandeur(varY)
+                      {seriesA.map((s, idx) => {
                         const color = PLOTLY_COLORS[idx % PLOTLY_COLORS.length]
+                        const yData = s.isXY ? s.y : appliquerMoyenneGlissante(s.y, smoothingWindow)
                         return (
-                          <div key={varY} style={{ border: '1px solid #e2e8f0', borderRadius: 8, padding: 8 }}>
+                          <div key={s.id} style={{ border: '1px solid #e2e8f0', borderRadius: 8, padding: 8 }}>
                             <Plot
                               data={[{
-                                x: convergence.map((row) => row[axesA.axeX]),
-                                y: appliquerMoyenneGlissante(convergence.map((row) => row[varY]), smoothingWindow),
+                                x: s.x,
+                                y: yData,
                                 type: 'scatter',
-                                mode: convergence.length <= 15 ? 'lines+markers' : 'lines',
-                                name: varY,
+                                mode: s.nbPoints <= 15 ? 'lines+markers' : 'lines',
+                                name: s.colY,
                                 line: { width: 2, color },
                               }]}
-                              layout={creerLayoutPlotly(`${varY} — ${simActive.nom}`, axesA.labelX, grp.unite, 370, yScale, axesA.isIntegerX, axesA.nbPoints, syncedRangeX)}
+                              layout={creerLayoutPlotly(
+                                `${s.colY} (${s.nbPoints} pts)${s.fileName && s.fileName !== simActive.nom ? ` — ${s.fileName}` : ''}`,
+                                s.labelX,
+                                s.unite,
+                                370,
+                                yScale,
+                                s.isIntegerX,
+                                s.nbPoints,
+                                null
+                              )}
                               style={{ width: '100%' }}
                               useResizeHandler
-                              onRelayout={gererRelayoutZoom}
                               onInitialized={(_, g) => { if (idx === 0) activePlotRef.current = g }}
                               onUpdate={(_, g) => { if (idx === 0) activePlotRef.current = g }}
                             />
@@ -1542,48 +1534,10 @@ export default function App() {
                         )
                       })}
                     </div>
-                  ) : (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-                      {groupesA.map((grp, idx) => {
-                        const useDual = dualYAxis && grp.vars.length > 1
-                        const leftVars = useDual ? [grp.vars[0]] : grp.vars
-                        const rightVars = useDual ? grp.vars.slice(1) : []
-                        return (
-                          <Plot
-                            key={grp.id}
-                            data={grp.vars.map((varY, vIdx) => {
-                              const isRight = useDual && vIdx > 0
-                              const color = PLOTLY_COLORS[vIdx % PLOTLY_COLORS.length]
-                              return {
-                                x: convergence.map((row) => row[axesA.axeX]),
-                                y: appliquerMoyenneGlissante(convergence.map((row) => row[varY]), smoothingWindow),
-                                type: 'scatter',
-                                mode: convergence.length <= 15 ? 'lines+markers' : 'lines',
-                                name: `${varY}${isRight ? ' (axe droit)' : ''}`,
-                                yaxis: isRight ? 'y2' : 'y',
-                                line: { width: 2, color },
-                              }
-                            })}
-                            layout={creerLayoutPlotly(
-                              `${grp.titre} — ${simActive.nom}`, axesA.labelX, grp.unite, 390, yScale,
-                              axesA.isIntegerX, axesA.nbPoints, syncedRangeX, useDual,
-                              PLOTLY_COLORS[0], PLOTLY_COLORS[1],
-                              leftVars.join(', '), rightVars.join(', ')
-                            )}
-                            style={{ width: '100%' }}
-                            useResizeHandler
-                            onRelayout={gererRelayoutZoom}
-                            onInitialized={(_, g) => { if (idx === 0) activePlotRef.current = g }}
-                            onUpdate={(_, g) => { if (idx === 0) activePlotRef.current = g }}
-                          />
-                        )
-                      })}
-                    </div>
                   )}
                 </div>
               )}
 
-              {/* Champs CFD */}
               {isComparing ? (
                 (simActive.url_visuel_3d || simActiveB.url_visuel_3d) && (
                   <div className="card">
@@ -1608,7 +1562,6 @@ export default function App() {
             </>
           )}
 
-          {/* ONGLET RÉPARTITIONS PARIÉTALES (Ligne Cf=0 + zone décollement rouge) */}
           {isAile2D && activeTab === 'paroi' && (
             <div className="card">
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
@@ -1681,7 +1634,6 @@ export default function App() {
             </div>
           )}
 
-          {/* ONGLET POLAIRES DU PROJET (REV-48 : légende corrigée + lignes sans Cl/Cd grisées) */}
           {isAile2D && activeTab === 'polaires' && (
             <div className="card">
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
@@ -1778,7 +1730,6 @@ export default function App() {
             </div>
           )}
 
-          {/* ONGLET ÉCOULEMENT INTERNE : BILANS */}
           {isInterne && activeTab === 'interne_bilans' && (
             <div className="card">
               <h2>Bilans, Répartition des débits & Pertes — {simActive.nom}</h2>
@@ -1833,7 +1784,6 @@ export default function App() {
             </div>
           )}
 
-          {/* ONGLET COURBE ΔP(Q) DU PROJET (avec R² — REV-39) */}
           {isInterne && activeTab === 'interne_carac' && (
             <div className="card">
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
