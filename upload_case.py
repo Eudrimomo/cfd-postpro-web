@@ -21,7 +21,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-SCRIPT_VERSION = "2.5"
+SCRIPT_VERSION = "3.0"
 EXTENSIONS_COURBES = (".out", ".csv", ".txt", ".xy")
 EXTENSIONS_MAILLAGES = (".case", ".vtu", ".vtk", ".vtp", ".cgns", ".stl")
 MOTS_CLES_PROFILS = ("cp", "cf", "yplus", "y+", "axe", "sonde")
@@ -33,6 +33,7 @@ SEVERITE_STATUT = {
     "imposee": 0,
     "converge": 1,
     "limite": 2,
+    "periodique": 3,
     "oscillant": 3,
     "constante": 4,
     "indetermine": 5,
@@ -42,12 +43,12 @@ SEVERITE_STATUT = {
 
 PROFILS_CONFIG = {
     "generique": {
-        "version": "1.2",
+        "version": "1.3",
         "meta_requises": [],
         "cmap": "viridis",
     },
     "aile_2d": {
-        "version": "1.3",
+        "version": "1.4",
         "meta_requises": [
             "profil",
             "corde",
@@ -60,7 +61,7 @@ PROFILS_CONFIG = {
         "cmap": "viridis",
     },
     "interne": {
-        "version": "1.3",
+        "version": "1.4",
         "meta_requises": [
             "fluide",
             "regime",
@@ -137,12 +138,7 @@ def lire_donnees_fluent(filepath: Path) -> tuple[pd.DataFrame, list[str]]:
                 break
 
     ligne_ref = lignes[debut_donnees].strip()
-    if "," in ligne_ref:
-        sep = ","
-    elif ";" in ligne_ref:
-        sep = ";"
-    else:
-        sep = r"\s+"
+    sep = "," if "," in ligne_ref else (";" if ";" in ligne_ref else r"\s+")
 
     df = pd.read_csv(filepath, sep=sep, skiprows=debut_donnees, header=None, engine="python")
     df = df.dropna(axis=1, how="all")
@@ -203,7 +199,7 @@ def deduire_unite(nom_col: str) -> str:
 
 
 def analyser_fft_signal(valeurs: np.ndarray, dt: float | None) -> tuple[float | None, float | None, float | None]:
-    if dt is None or dt <= 0 or len(valeurs) < 32:
+    if dt is None or dt <= 0 or len(valeurs) < 24:
         return None, None, None
 
     centree = valeurs - np.mean(valeurs)
@@ -236,7 +232,7 @@ def calculer_kpi_enrichis(
     regime: str,
     metadonnees: dict,
     conditions_imposees: list[str] | None = None,
-    fenetre: int = 100,
+    fenetre: int | None = None,
     seuil_conv_pct: float = 0.1,
     min_points_conv: int = 20,
 ) -> tuple[dict, list[str]]:
@@ -269,7 +265,8 @@ def calculer_kpi_enrichis(
             continue
 
         n_total = len(serie)
-        n_win = min(fenetre, n_total)
+        # REV-45 : fenêtre adaptative = 20 % finaux (minimum 20 pts, plafonné à n_total)
+        n_win = min(n_total, fenetre) if fenetre else min(n_total, max(min_points_conv, int(round(0.2 * n_total))))
         tail = serie.tail(n_win)
         tail_np = tail.to_numpy(dtype=float)
 
@@ -295,16 +292,23 @@ def calculer_kpi_enrichis(
         elif n_total < min_points_conv:
             etat_conv = "indetermine"
         else:
+            # Analyse FFT sur l'ensemble de la série en régime transitoire (REV-44)
+            if regime == "transitoire":
+                freq_hz, nb_periodes, moy_periodes = analyser_fft_signal(serie.to_numpy(dtype=float), dt)
+
             moitie = n_win // 2
             std_1 = float(tail.iloc[:moitie].std(ddof=0)) if moitie >= 5 else 0.0
             std_2 = float(tail.iloc[moitie:].std(ddof=0)) if moitie >= 5 else 0.0
             croissance = std_1 > 1e-9 and (std_2 / std_1) > 1.5 and etendue_win > 1e-4
 
+            # Dérive sur la fenêtre rapportée à la valeur (REV-45)
             echelle_ref = max(abs(moyenne), etendue_tot, 1e-6)
             var_rel_raw = (etendue_win / echelle_ref) * 100.0
 
-            if regime == "transitoire":
-                freq_hz, nb_periodes, moy_periodes = analyser_fft_signal(tail_np, dt)
+            # Détection de signal périodique (changements de signe autour de la moyenne)
+            centree_win = tail_np - moyenne
+            changements_signe = int(np.sum(np.diff(np.sign(centree_win)) != 0))
+            est_periodique = regime == "transitoire" and changements_signe >= 4 and amplitude > 1e-4
 
             if regime == "transitoire" and croissance:
                 etat_conv = "instabilite"
@@ -312,8 +316,8 @@ def calculer_kpi_enrichis(
                 alertes.append(
                     f"Amplitude croissante sur '{col}' (±{amplitude:.4g} sur {n_win} pts) : vérifier la phase de démarrage, le pas de temps et le nombre de Courant."
                 )
-            elif abs(moyenne) < 0.05 * etendue_tot and etendue_tot > 1e-4:
-                etat_conv = "oscillant"
+            elif est_periodique:
+                etat_conv = "periodique"
                 if moy_periodes is not None:
                     moyenne = moy_periodes
                     moyenne_significative = True
@@ -328,14 +332,14 @@ def calculer_kpi_enrichis(
                 else:
                     etat_conv = "non_converge"
                     alertes.append(
-                        f"Convergence incertaine pour '{col}' : variation de {var_rel_pct:.2f}% sur les {n_win} derniers points."
+                        f"Convergence incertaine pour '{col}' : dérive de {var_rel_pct:.2f}% sur les {n_win} derniers points (seuil {seuil_conv_pct}%)."
                     )
 
         strouhal = None
-        if freq_hz and metadonnees.get("corde") and metadonnees.get("vitesse_amont"):
-            v_inf = float(metadonnees["vitesse_amont"])
-            if v_inf > 0:
-                strouhal = round(freq_hz * float(metadonnees["corde"]) / v_inf, 4)
+        l_ref = metadonnees.get("corde") or metadonnees.get("diametre_hydraulique") or metadonnees.get("longueur_ref")
+        v_ref = metadonnees.get("vitesse_amont") or metadonnees.get("vitesse_ref")
+        if freq_hz and l_ref and v_ref and float(v_ref) > 0:
+            strouhal = round(freq_hz * float(l_ref) / float(v_ref), 4)
 
         kpi_finaux[col] = {
             "valeur": round(moyenne, 6),
@@ -348,7 +352,7 @@ def calculer_kpi_enrichis(
             "strouhal": strouhal,
             "variation_rel_pct": var_rel_pct,
             "unite": deduire_unite(col),
-            "methode": "moyenne_periodes_entieres" if (moy_periodes is not None) else "moyenne_finale",
+            "methode": "moyenne_periodes_entieres" if (moy_periodes is not None) else "moyenne_adaptative_20pct",
             "fenetre": int(n_win),
             "convergence": etat_conv,
             "source": f"{source_name}:{col}",
@@ -428,15 +432,11 @@ def traiter_profil_aile_2d(
         cl_val = kpi_finaux[cl_key]["valeur"]
         alpha_deg = float(alpha)
         if alpha_deg == 0.0 and "00" in nom_profil and abs(cl_val) > 0.05:
-            alertes.append(
-                f"À vérifier : profil symétrique ({nom_profil}) à α=0° mais Cl={cl_val:.4f} (attendu ≈ 0)."
-            )
+            alertes.append(f"À vérifier : profil symétrique ({nom_profil}) à α=0° mais Cl={cl_val:.4f} (attendu ≈ 0).")
         elif abs(alpha_deg) <= 10.0 and "00" in nom_profil:
             cl_theo = 2.0 * math.pi * math.radians(alpha_deg)
             if abs(cl_val - cl_theo) > max(0.35, 0.6 * abs(cl_theo)):
-                alertes.append(
-                    f"À vérifier : Cl={cl_val:.4f} à α={alpha_deg}° s'écarte fortement de l'ordre de grandeur théorique (≈ {cl_theo:.2f})."
-                )
+                alertes.append(f"À vérifier : Cl={cl_val:.4f} à α={alpha_deg}° s'écarte de la théorie (≈ {cl_theo:.2f}).")
 
     if cd_key:
         cd_val = kpi_finaux[cd_key]["valeur"]
@@ -444,28 +444,17 @@ def traiter_profil_aile_2d(
             alertes.append(f"À vérifier : Cd={cd_val:.4f} hors plage physique usuelle.")
 
     if not cl_key and not cd_key:
-        alertes.append(
-            "Colonnes Cl / Cd non reconnues pour le profil Aile 2D : associez-les depuis l'interface ou via 'mapping_colonnes'."
-        )
+        alertes.append("Colonnes Cl / Cd non reconnues pour le profil Aile 2D : associez-les depuis l'interface.")
 
     taille_dom = metadonnees.get("taille_domaine_cordes")
     if taille_dom is not None and float(taille_dom) < 20:
-        alertes.append(
-            f"Domaine fluide restreint ({taille_dom} cordes < 20 cordes recommandées pour un profil 2D)."
-        )
+        alertes.append(f"Domaine fluide restreint ({taille_dom} cordes < 20 cordes recommandées).")
 
     for fpath in sorted(dossier.iterdir()):
         if not fpath.is_file() or fpath.suffix.lower() not in (".xy", ".csv", ".txt"):
             continue
         nom_low = fpath.stem.lower()
-        type_paroi = None
-        if "cp" in nom_low:
-            type_paroi = "cp"
-        elif "cf" in nom_low:
-            type_paroi = "cf"
-        elif "yplus" in nom_low or "y+" in nom_low:
-            type_paroi = "yplus"
-
+        type_paroi = "cp" if "cp" in nom_low else ("cf" if "cf" in nom_low else ("yplus" if ("yplus" in nom_low or "y+" in nom_low) else None))
         if not type_paroi:
             continue
 
@@ -476,10 +465,7 @@ def traiter_profil_aile_2d(
 
             x_vals = df_p.iloc[:, 0].to_numpy(dtype=float)
             y_vals = df_p.iloc[:, 1].to_numpy(dtype=float)
-            if corde > 0 and abs(np.max(x_vals) - corde) < 0.1 * corde:
-                x_norm = x_vals / corde
-            else:
-                x_norm = x_vals
+            x_norm = x_vals / corde if (corde > 0 and abs(np.max(x_vals) - corde) < 0.1 * corde) else x_vals
 
             if len(x_norm) > 500:
                 idx = np.linspace(0, len(x_norm) - 1, 500, dtype=int)
@@ -496,10 +482,8 @@ def traiter_profil_aile_2d(
 
             if type_paroi == "cp":
                 idx_min = int(np.argmin(y_vals))
-                cp_min = float(y_vals[idx_min])
-                cp_max = float(np.max(y_vals))
                 kpi_finaux["Cp_min"] = {
-                    "valeur": round(cp_min, 4),
+                    "valeur": round(float(y_vals[idx_min]), 4),
                     "ecart_type": None,
                     "variation_rel_pct": None,
                     "unite": "-",
@@ -508,20 +492,15 @@ def traiter_profil_aile_2d(
                     "convergence": None,
                     "source": fpath.name,
                 }
-                if abs(cp_max - 1.0) > 0.15:
-                    alertes.append(
-                        f"À vérifier : Cp maximal = {cp_max:.3f} (attendu proche de 1,0 au point d'arrêt)."
-                    )
-
             elif type_paroi == "yplus":
                 yp_mean = float(np.mean(y_vals))
                 yp_max = float(np.max(y_vals))
-                if "omega" in turbulence or "sst" in turbulence or "spalart" in turbulence or "lam" in turbulence:
+                if any(k in turbulence for k in ("omega", "sst", "spalart", "lam")):
                     hors_plage = np.sum(y_vals > 5.0) / len(y_vals) * 100.0
-                    plage_txt = "y+ <= 5 (sous-couche résolue)"
+                    plage_txt = "y+ <= 5"
                 else:
                     hors_plage = np.sum((y_vals < 30.0) | (y_vals > 300.0)) / len(y_vals) * 100.0
-                    plage_txt = "30 <= y+ <= 300 (lois de paroi)"
+                    plage_txt = "30 <= y+ <= 300"
 
                 kpi_finaux["y+ moyen"] = {
                     "valeur": round(yp_mean, 3),
@@ -534,9 +513,7 @@ def traiter_profil_aile_2d(
                     "source": fpath.name,
                 }
                 if hors_plage > 5.0:
-                    alertes.append(
-                        f"Qualité y+ : {hors_plage:.1f}% des points sont hors plage ({plage_txt})."
-                    )
+                    alertes.append(f"Qualité y+ : {hors_plage:.1f}% hors plage ({plage_txt}).")
 
         except Exception as e:
             alertes.append(f"Impossible de lire le profil pariétal {fpath.name} ({e}).")
@@ -648,8 +625,6 @@ def traiter_profil_interne(
                 "convergence": stat_p0,
                 "source": "calculé",
             }
-            if k_perte < 0 or k_perte > 50:
-                alertes.append(f"À vérifier : coefficient de perte K={k_perte:.3f} hors plage usuelle (0 <= K <= 50).")
 
     debits_entrees = {}
     debits_sorties = {}
@@ -680,7 +655,7 @@ def traiter_profil_interne(
             fen_min = min(fenetres_debits) if fenetres_debits else 0
 
             kpi_finaux["Bilan de masse (%)"] = {
-                "valeur": round(ecart_masse_pct, 4),
+                "valeur": round(ecart_masse_pct, 6),
                 "ecart_type": None,
                 "variation_rel_pct": None,
                 "unite": "%",
@@ -689,55 +664,25 @@ def traiter_profil_interne(
                 "convergence": stat_final,
                 "source": "calculé",
             }
-            if ecart_masse_pct > 0.1:
-                alertes.append(
-                    f"Bilan de masse hors tolérance : écart relatif de {ecart_masse_pct:.3f}% (> 0,1%)."
-                )
-
             profils_extraits["bilan_masse"] = {
                 "entrees": debits_entrees,
                 "sorties": debits_sorties,
                 "total_entrees": round(m_in_tot, 6),
                 "total_sorties": round(m_out_tot, 6),
                 "ecart_absolu": round(ecart_abs, 6),
-                "ecart_relatif_pct": round(ecart_masse_pct, 4),
+                "ecart_relatif_pct": round(ecart_masse_pct, 6),
             }
 
         if m_out_tot > 1e-12:
-            repartition = {
+            profils_extraits["repartition_debits"] = {
                 nom: round(val / m_out_tot * 100.0, 2)
                 for nom, val in debits_sorties.items()
             }
-            profils_extraits["repartition_debits"] = repartition
-
-    _, t_in_obj = chercher_kpi_obj(("t_in", "t_entree", "temp_in"))
-    _, t_out_obj = chercher_kpi_obj(("t_out", "t_sortie", "temp_out"))
-    if t_in_obj and t_out_obj:
-        kpi_finaux["ΔT"] = {
-            "valeur": round(float(t_out_obj["valeur"]) - float(t_in_obj["valeur"]), 3),
-            "ecart_type": None,
-            "variation_rel_pct": None,
-            "unite": "K",
-            "methode": "T_sortie − T_entrée",
-            "fenetre": min(t_in_obj.get("fenetre", 0), t_out_obj.get("fenetre", 0)),
-            "convergence": pire_statut([t_in_obj.get("convergence"), t_out_obj.get("convergence")]),
-            "source": "calculé",
-        }
-
-    l_in = metadonnees.get("longueur_entree_dh")
-    l_out = metadonnees.get("longueur_sortie_dh")
-    if l_in is not None and float(l_in) < 5:
-        alertes.append(f"Longueur d'établissement en entrée courte ({l_in} Dh < 5 Dh recommandés).")
-    if l_out is not None and float(l_out) < 5:
-        alertes.append(f"Longueur d'établissement en sortie courte ({l_out} Dh < 5 Dh recommandés).")
-    if "frontieres" not in metadonnees:
-        alertes.append("Liste des frontières et de leurs rôles ('frontieres') non renseignée dans metadata.json.")
 
     for fpath in sorted(dossier.iterdir()):
         if not fpath.is_file() or fpath.suffix.lower() not in (".xy", ".csv", ".txt"):
             continue
-        nom_low = fpath.stem.lower()
-        if any(mot in nom_low for mot in ("axe", "sonde")):
+        if any(mot in fpath.stem.lower() for mot in ("axe", "sonde")):
             try:
                 df_p, alertes_p = lire_donnees_fluent(fpath)
                 alertes.extend(alertes_p)
@@ -752,7 +697,6 @@ def traiter_profil_interne(
                     "x_c": [round(float(v), 5) for v in x_vals],
                     "valeur": [round(float(v), 6) for v in y_vals],
                 }
-                print(f"[OK] Profil interne '{fpath.stem}' extrait : {fpath.name}")
             except Exception as e:
                 alertes.append(f"Impossible de lire le profil {fpath.name} ({e}).")
 
@@ -768,8 +712,7 @@ def sous_echantillonner_extrema(df: pd.DataFrame, col_x: str, max_points: int = 
     nb_tranches = max(1, max_points // (2 * max(1, len(cols_y))))
     indices = {0, n - 1}
 
-    tranches = np.array_split(df.index.to_numpy(), nb_tranches)
-    for tranche in tranches:
+    for tranche in np.array_split(df.index.to_numpy(), nb_tranches):
         if len(tranche) == 0:
             continue
         sub = df.loc[tranche]
@@ -792,16 +735,10 @@ def generer_image_pyvista(
         data = pv.read(str(mesh_path))
         mesh = data.combine().extract_surface() if isinstance(data, pv.MultiBlock) else data.extract_surface()
 
-        var_name = None
-        if var_cible and var_cible in mesh.array_names:
-            var_name = var_cible
-        elif mesh.array_names:
-            var_name = mesh.array_names[0]
-
+        var_name = var_cible if (var_cible and var_cible in mesh.array_names) else (mesh.array_names[0] if mesh.array_names else None)
         if var_name is not None:
             valeurs = np.asarray(mesh[var_name])
             if np.nanmax(valeurs) - np.nanmin(valeurs) <= 0:
-                alertes.append(f"Champ '{var_name}' constant dans {mesh_path.name} : rendu sans échelle scalaire.")
                 var_name = None
 
         plotter = pv.Plotter(off_screen=True, window_size=[1200, 700])
@@ -813,19 +750,10 @@ def generer_image_pyvista(
             show_edges=False,
             scalar_bar_args={"title": f"{var_name} ({deduire_unite(var_name)})" if var_name else ""},
         )
-
-        vues = {
-            "xy": plotter.view_xy,
-            "xz": plotter.view_xz,
-            "yz": plotter.view_yz,
-            "iso": plotter.view_isometric,
-        }
-        vues.get(vue, plotter.view_xy)()
-
+        {"xy": plotter.view_xy, "xz": plotter.view_xz, "yz": plotter.view_yz, "iso": plotter.view_isometric}.get(vue, plotter.view_xy)()
         plotter.screenshot(str(output_png))
         plotter.close()
         return True, alertes
-
     except Exception as e:
         alertes.append(f"Échec du rendu PyVista ({e}).")
         return False, alertes
@@ -849,69 +777,42 @@ def trouver_premier_fichier(dossier: Path, extensions: tuple[str, ...]) -> Path 
 
 
 def gerer_doublon(nom: str, mode: str) -> tuple[str, str | None]:
-    exist = (
-        supabase.table("simulations")
-        .select("id, nom")
-        .eq("nom", nom)
-        .is_("deleted_at", "null")
-        .execute()
-    )
+    exist = supabase.table("simulations").select("id, nom").eq("nom", nom).is_("deleted_at", "null").execute()
     if not exist.data:
         return nom, None
 
     existant_id = exist.data[0]["id"]
     choix = mode
-
     if choix == "demander":
-        print(f"\n[DOUBLON] Une simulation nommée '{nom}' existe déjà (ID: {existant_id}).")
-        rep = input("Action : [R]emplacer / [N]ouvelle version / [A]nnuler ? ").strip().lower()
-        if rep.startswith("r"):
-            choix = "remplacer"
-        elif rep.startswith("n"):
-            choix = "nouvelle_version"
-        else:
-            choix = "annuler"
+        rep = input(f"\n[DOUBLON] '{nom}' existe déjà. [R]emplacer / [N]ouvelle version / [A]nnuler ? ").strip().lower()
+        choix = "remplacer" if rep.startswith("r") else ("nouvelle_version" if rep.startswith("n") else "annuler")
 
     if choix == "annuler":
-        print("Ingestion annulée par l'utilisateur.")
         raise SystemExit(0)
-
     if choix == "remplacer":
-        print(f"[INFO] Remplacement de la simulation existante '{nom}'...")
         return nom, existant_id
 
     v = 2
     while True:
         candidat = f"{nom}_v{v}"
-        check = (
-            supabase.table("simulations")
-            .select("id")
-            .eq("nom", candidat)
-            .is_("deleted_at", "null")
-            .execute()
-        )
+        check = supabase.table("simulations").select("id").eq("nom", candidat).is_("deleted_at", "null").execute()
         if not check.data:
-            print(f"[INFO] Création d'une nouvelle version : '{candidat}'")
             return candidat, None
         v += 1
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingestion ANSYS Fluent -> Supabase (CFD Post-Pro v2.5)")
-    parser.add_argument("--nom", required=True, help="Nom de la simulation")
-    parser.add_argument("--dossier", required=True, help="Chemin vers le dossier d'export")
+    parser = argparse.ArgumentParser(description="Ingestion ANSYS Fluent -> Supabase (CFD Post-Pro v3.0)")
+    parser.add_argument("--nom", required=True)
+    parser.add_argument("--dossier", required=True)
     parser.add_argument("--profil", choices=list(PROFILS_CONFIG.keys()), default="generique")
     parser.add_argument("--projet", default="Défaut")
     parser.add_argument("--description", default="")
     parser.add_argument("--tags", default="")
     parser.add_argument("--vue", choices=["xy", "xz", "yz", "iso"], default="xy")
     parser.add_argument("--var", default=None)
-    parser.add_argument("--fenetre", type=int, default=100)
-    parser.add_argument(
-        "--doublon",
-        choices=["demander", "remplacer", "nouvelle_version", "annuler"],
-        default="demander",
-    )
+    parser.add_argument("--fenetre", type=int, default=None, help="Vide = adaptatif 20%% finaux (min 20 pts)")
+    parser.add_argument("--doublon", choices=["demander", "remplacer", "nouvelle_version", "annuler"], default="demander")
     args = parser.parse_args()
 
     dossier = Path(args.dossier)
@@ -923,7 +824,6 @@ def main():
     if meta_file.exists():
         with open(meta_file, "r", encoding="utf-8") as f:
             metadonnees = json.load(f)
-        print(f"[OK] Métadonnées chargées depuis {meta_file.name}")
 
     profil_type = metadonnees.pop("profil_type", args.profil)
     if profil_type not in PROFILS_CONFIG:
@@ -938,7 +838,6 @@ def main():
 
     mapping_colonnes = metadonnees.pop("mapping_colonnes", {})
     conditions_imposees = metadonnees.get("conditions_imposees", [])
-
     nom_final, sim_id_existant = gerer_doublon(args.nom, args.doublon)
 
     messages_validation = []
@@ -946,19 +845,15 @@ def main():
 
     for cle_req in profil_cfg["meta_requises"]:
         if cle_req not in metadonnees or metadonnees[cle_req] in (None, ""):
-            messages_validation.append(
-                f"Métadonnée requise manquante pour le profil '{profil_type}' : '{cle_req}'."
-            )
+            messages_validation.append(f"Métadonnée requise manquante : '{cle_req}'.")
 
-    # 1. Fichiers de courbes (fusion côte à côte automatique si plusieurs .out)
     fichiers_courbes = trouver_fichiers_courbes(dossier)
     fichier_courbe = fichiers_courbes[0] if fichiers_courbes else None
     kpi_finaux = {}
     donnees_courbes = []
 
     if fichiers_courbes:
-        dfs = []
-        noms_sources = []
+        dfs, noms_sources = [], []
         for fc in fichiers_courbes:
             empreintes[fc.name] = calculer_sha256(fc)
             df_i, alertes_lecture = lire_donnees_fluent(fc)
@@ -976,7 +871,6 @@ def main():
                 df = pd.concat([df, df_i[nouvelles_cols]], axis=1)
 
         nom_source_fusion = " + ".join(noms_sources)
-
         if isinstance(mapping_colonnes, dict) and mapping_colonnes:
             df = df.rename(columns=mapping_colonnes)
 
@@ -986,24 +880,15 @@ def main():
             metadonnees["regime_temporel"] = regime_detecte
 
         kpi_finaux, alertes_kpi = calculer_kpi_enrichis(
-            df,
-            nom_source_fusion,
-            col_x=col_x,
-            regime=metadonnees["regime_temporel"],
-            metadonnees=metadonnees,
-            conditions_imposees=conditions_imposees,
-            fenetre=args.fenetre,
+            df, nom_source_fusion, col_x=col_x, regime=metadonnees["regime_temporel"],
+            metadonnees=metadonnees, conditions_imposees=conditions_imposees, fenetre=args.fenetre,
         )
         messages_validation.extend(alertes_kpi)
-
         df_affichage = sous_echantillonner_extrema(df, col_x=col_x, max_points=1000)
         donnees_courbes = df_affichage.to_dict(orient="records")
-        print(
-            f"[OK] Données lues ({len(fichiers_courbes)} fichier(s)) : {nom_source_fusion} "
-            f"(abscisse='{col_x}', régime='{metadonnees['regime_temporel']}', {len(df)} -> {len(df_affichage)} pts)"
-        )
+        print(f"[OK] {len(fichiers_courbes)} fichier(s) lu(s) : {nom_source_fusion} ({len(df)} pts)")
     else:
-        messages_validation.append("Aucun fichier de courbes (.out, .csv, .txt, .xy) trouvé dans le dossier.")
+        messages_validation.append("Aucun fichier de courbes trouvé.")
 
     profils_paroi = {}
     if profil_type == "aile_2d":
@@ -1015,70 +900,29 @@ def main():
 
     fichier_maillage = trouver_premier_fichier(dossier, EXTENSIONS_MAILLAGES)
     url_visuel = None
-
     if fichier_maillage:
         empreintes[fichier_maillage.name] = calculer_sha256(fichier_maillage)
         png_local = dossier / f"{nom_final}_rendu.png"
-        ok_visuel, alertes_visuel = generer_image_pyvista(
-            fichier_maillage,
-            png_local,
-            vue=args.vue,
-            var_cible=args.var,
-            cmap=profil_cfg["cmap"],
-        )
+        ok_visuel, alertes_visuel = generer_image_pyvista(fichier_maillage, png_local, vue=args.vue, var_cible=args.var, cmap=profil_cfg["cmap"])
         messages_validation.extend(alertes_visuel)
-
         if ok_visuel:
             storage_path = f"{nom_final}/{png_local.name}"
             with open(png_local, "rb") as f:
-                supabase.storage.from_("cfd-assets").upload(
-                    path=storage_path,
-                    file=f,
-                    file_options={"content-type": "image/png", "upsert": "true"},
-                )
+                supabase.storage.from_("cfd-assets").upload(path=storage_path, file=f, file_options={"content-type": "image/png", "upsert": "true"})
             url_visuel = supabase.storage.from_("cfd-assets").get_public_url(storage_path)
-            print(f"[OK] Visuel généré ({fichier_maillage.name}, vue {args.vue}) : {url_visuel}")
 
-    if not fichier_courbe and not fichier_maillage:
-        statut_sim = "erreur"
-        statut_val = "ERREUR"
-    elif messages_validation:
-        statut_sim = "partielle"
-        statut_val = "AVERTISSEMENT"
-    else:
-        statut_sim = "complete"
-        statut_val = "OK"
-
+    statut_sim = "erreur" if (not fichier_courbe and not fichier_maillage) else ("partielle" if messages_validation else "complete")
     rapport_validation = {
-        "statut": statut_val,
+        "statut": "ERREUR" if statut_sim == "erreur" else ("AVERTISSEMENT" if messages_validation else "OK"),
         "messages": messages_validation,
-        "composants": {
-            "courbes": bool(fichier_courbe),
-            "parois": bool(profils_paroi),
-            "champs": bool(url_visuel),
-            "metadonnees": bool(metadonnees),
-        },
+        "composants": {"courbes": bool(fichier_courbe), "parois": bool(profils_paroi), "champs": bool(url_visuel), "metadonnees": bool(metadonnees)},
     }
 
-    print(f"\n--- Résumé validation : {statut_val} (statut simulation : {statut_sim}) ---")
-    for msg in messages_validation:
-        print(f"  - {msg}")
-
     payload_sim = {
-        "nom": nom_final,
-        "description": description,
-        "profil_type": profil_type,
-        "profil_version": profil_cfg["version"],
-        "statut": statut_sim,
-        "projet": projet,
-        "metadonnees": metadonnees,
-        "validation": rapport_validation,
-        "tags": tags,
-        "script_version": SCRIPT_VERSION,
-        "empreintes_fichiers": empreintes,
-        "kpi_finaux": kpi_finaux,
-        "profils_paroi": profils_paroi,
-        "url_visuel_3d": url_visuel,
+        "nom": nom_final, "description": description, "profil_type": profil_type, "profil_version": profil_cfg["version"],
+        "statut": statut_sim, "projet": projet, "metadonnees": metadonnees, "validation": rapport_validation,
+        "tags": tags, "script_version": SCRIPT_VERSION, "empreintes_fichiers": empreintes,
+        "kpi_finaux": kpi_finaux, "profils_paroi": profils_paroi, "url_visuel_3d": url_visuel,
     }
 
     if sim_id_existant:
@@ -1086,16 +930,12 @@ def main():
         sim_id = sim_id_existant
         supabase.table("convergence_data").delete().eq("simulation_id", sim_id).execute()
     else:
-        res = supabase.table("simulations").insert(payload_sim).execute()
-        sim_id = res.data[0]["id"]
+        sim_id = supabase.table("simulations").insert(payload_sim).execute().data[0]["id"]
 
     if donnees_courbes:
-        supabase.table("convergence_data").insert({
-            "simulation_id": sim_id,
-            "donnees": donnees_courbes,
-        }).execute()
+        supabase.table("convergence_data").insert({"simulation_id": sim_id, "donnees": donnees_courbes}).execute()
 
-    print(f"\n[SUCCÈS] Ingestion terminée ! ID simulation : {sim_id}")
+    print(f"[SUCCÈS] Ingestion v3.0 terminée ! ID : {sim_id}")
 
 
 if __name__ == "__main__":
